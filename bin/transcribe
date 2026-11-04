@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Transcribe audio/video files (or the microphone) with whisper.cpp on the GPU.
+#
+#   transcribe [options] FILE...   writes FILE.txt and FILE.srt next to each file
+#   transcribe [options]           records the mic until Enter, prints the text
+#                                  and copies it to the clipboard
+#
+# Options:
+#   -l LANG    spoken language (pt, en, ...), default: auto-detect
+#   -m MODEL   ggml model name, default: large-v3-turbo
+#   -t         translate to English
+#   -h         show this help
+#
+# Models are downloaded on first use to ${XDG_DATA_HOME:-~/.local/share}/whisper.
+set -euo pipefail
+
+lang=auto
+model=large-v3-turbo
+extra=()
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while getopts "l:m:th" opt; do
+    case $opt in
+        l) lang=$OPTARG ;;
+        m) model=$OPTARG ;;
+        t) extra+=(--translate) ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+model_dir="${XDG_DATA_HOME:-$HOME/.local/share}/whisper"
+model_file="$model_dir/ggml-$model.bin"
+if [[ ! -f $model_file ]]; then
+    mkdir -p "$model_dir"
+    echo "Downloading model $model to $model_dir..." >&2
+    curl -fL --progress-bar -o "$model_file.part" \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$model.bin"
+    mv "$model_file.part" "$model_file"
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# whisper.cpp wants 16 kHz mono WAV, so convert anything ffmpeg can read
+to_wav() { ffmpeg -nostdin -loglevel error -y -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$2"; }
+
+whisper() {
+    whisper-cli -m "$model_file" -l "$lang" "${extra[@]}" -np "$@"
+}
+
+if [[ $# -eq 0 ]]; then
+    echo "Recording... press Enter to stop." >&2
+    ffmpeg -nostdin -loglevel error -f pulse -i default -ar 16000 -ac 1 "$tmp/mic.wav" &
+    rec_pid=$!
+    read -r
+    kill -INT "$rec_pid"
+    wait "$rec_pid" || true
+    text=$(whisper -nt -f "$tmp/mic.wav" 2>/dev/null | sed 's/^[[:space:]]*//' | tr -s '\n' ' ')
+    text=${text%" "}
+    echo "$text"
+    if command -v wl-copy >/dev/null && [[ -n $text ]]; then
+        printf '%s' "$text" | wl-copy
+        echo "(copied to clipboard)" >&2
+    fi
+    exit 0
+fi
+
+for file in "$@"; do
+    echo "Transcribing $file..." >&2
+    to_wav "$file" "$tmp/audio.wav"
+    out="${file%.*}"
+    whisper -f "$tmp/audio.wav" -otxt -osrt -of "$out" 2>/dev/null >/dev/null
+    cat "$out.txt"
+    echo "-> $out.txt, $out.srt" >&2
+done

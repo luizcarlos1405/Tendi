@@ -1,0 +1,30 @@
+{
+  "bar": {
+    "tooltip": "Dictation history"
+  },
+  "history": {
+    "clear": "Clear history",
+    "clear_confirm": "Clear all?",
+    "copy_failed": "Could not copy to the clipboard.",
+    "empty": "No transcriptions yet",
+    "empty_hint": "Everything you dictate is saved here.",
+    "settings": "Settings",
+    "title": "Dictation history",
+    "yesterday": "Yesterday, {time}"
+  },
+  "settings": {
+    "history_size": {
+      "description": "How many of the latest transcriptions the history keeps.",
+      "label": "Transcriptions to keep"
+    },
+    "lock_by_default": {
+      "description": "Start each dictation locked, so it keeps listening through pauses until you stop it. The lock button still switches it.",
+      "label": "Lock by default"
+    },
+    "type_by_default": {
+      "description": "Start each dictation with typing on: the text is pasted into the focused window. When typing is off, the text only goes to the history. The keyboard button still switches it.",
+      "label": "Type by default"
+    }
+  },
+  "title": "Dictation"
+}

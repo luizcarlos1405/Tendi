@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+# Dictation: record the mic, transcribe it with whisper live while you speak,
+# save the text to a history and paste it into the focused window.
+#
+#   dictate          start; running it again stops early and pastes the text
+#   dictate cancel   stop and throw the recording away
+#   dictate lock     toggle the lock: keep listening through pauses until stopped
+#   dictate type     toggle typing (pasting): when off, the text only goes to the
+#                    history
+#
+# Recording stops by itself after a pause once you have spoken, or gives up if
+# you say nothing, unless it is locked. While it runs, the luiz/dictation
+# Noctalia plugin shows a small mic indicator at the bottom of the screen, whose
+# buttons stop, toggle typing, lock and cancel through the same files in
+# $state_dir.
+#
+# Live transcription: a whisper-server started with the dictation keeps the
+# model loaded and re-transcribes everything said so far, over and over, into
+# $state_dir/live, which the indicator shows above its buttons. Each pass is a
+# full pass over that audio, so the text corrects itself as context grows, and
+# the pass that runs once you pause is the final text: stopping then pastes at
+# once. Past ~20 s, the audio before a pause gets committed and later passes
+# carry on after it (with the committed text as context), which keeps each
+# pass inside whisper's 30 s window. Without the server or the model, the
+# recording is transcribed in one go at the end with `transcribe`.
+#
+# Pasting is instant where typing key by key is not: the text goes on the
+# clipboard marked sensitive (so clipboard histories skip it), the paste keys
+# are pressed (Ctrl+Shift+V in terminals) and the clipboard gets back what it
+# held. Every transcription is also saved to $data_dir/history.jsonl (one JSON
+# object per line, newest last) first, since pasting into no text field loses
+# it silently. The plugin's bar icon lists the history for copying. The plugin
+# settings (history size, typing and lock on at the start) reach this script
+# through $data_dir/settings, which the plugin rewrites whenever they change.
+#
+# Environment (all optional):
+#   DICTATE_LANG       spoken language, as whisper's -l (default: auto)
+#   DICTATE_MODEL      whisper model, shared with `transcribe` (default:
+#                      large-v3-turbo)
+#   DICTATE_PORT       localhost port for the whisper server (default: 40000+UID)
+#   DICTATE_SOURCE     PulseAudio/PipeWire source to record (default: default),
+#                      or an audio file to dictate from in real time (testing)
+#   DICTATE_SPEECH_DB  RMS level in dBFS that counts as speech (default: -42)
+#   DICTATE_PAUSE      seconds of silence after speech that stop it (default: 2)
+#   DICTATE_WAIT       seconds to wait for speech before giving up (default: 8)
+#   DICTATE_MAX        hard limit on recording length in seconds (default: 900)
+set -uo pipefail
+
+lang=${DICTATE_LANG:-auto}
+model_file="${XDG_DATA_HOME:-$HOME/.local/share}/whisper/ggml-${DICTATE_MODEL:-large-v3-turbo}.bin"
+server_url="http://127.0.0.1:${DICTATE_PORT:-$((40000 + UID % 20000))}"
+source=${DICTATE_SOURCE:-default}
+speech_db=${DICTATE_SPEECH_DB:--42}
+pause=${DICTATE_PAUSE:-2}
+wait_secs=${DICTATE_WAIT:-8}
+max_secs=${DICTATE_MAX:-900}
+
+# The running dictation's state, removed when it ends
+state_dir="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+# What outlives it: the history and the plugin settings
+data_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dictate"
+history_file=$data_dir/history.jsonl
+panel="luiz/dictation:indicator"
+window_ms=100 # one level reading per 100 ms of audio
+window_bytes=3200 # 100 ms of 16 kHz mono s16le, the recording's raw format
+
+# The history may hold anything you said; keep what we write private
+umask 077
+mkdir -p "$state_dir"
+
+running() { [[ -f $state_dir/pid ]] && kill -0 "$(<"$state_dir/pid")" 2>/dev/null; }
+
+# lock and type are on while their file exists
+toggle() {
+    running || return 0
+    if [[ -f $state_dir/$1 ]]; then rm -f "$state_dir/$1"; else : >"$state_dir/$1"; fi
+}
+
+case ${1:-} in
+    cancel) running && : >"$state_dir/cancel"; exit 0 ;;
+    stop) running && : >"$state_dir/stop"; exit 0 ;;
+    lock | type) toggle "$1"; exit 0 ;;
+    "") ;;
+    *) sed -n '2,/^set /{/^#/s/^# \{0,1\}//p;}' "$0"; exit 1 ;;
+esac
+
+# A second press while recording means "I'm done, type it"
+if running; then
+    : >"$state_dir/stop"
+    exit 0
+fi
+
+# Plugin settings, as key=value lines; these defaults match its manifest and
+# apply until Noctalia has written the file once
+history_size=100
+type_by_default=true
+lock_by_default=false
+if [[ -r $data_dir/settings ]]; then
+    while IFS='=' read -r key value; do
+        case $key in
+            history_size) [[ $value =~ ^[1-9][0-9]*$ ]] && history_size=$value ;;
+            type_by_default) [[ $value == true || $value == false ]] && type_by_default=$value ;;
+            lock_by_default) [[ $value == true || $value == false ]] && lock_by_default=$value ;;
+        esac
+    done <"$data_dir/settings"
+fi
+
+notify() { noctalia msg notification-show "Dictation" "$1" >/dev/null 2>&1 || true; }
+
+set_state() {
+    printf '%s\n' "$1" >"$state_dir/state.tmp" && mv "$state_dir/state.tmp" "$state_dir/state"
+}
+
+set_level() {
+    printf '%s\n' "$1" >"$state_dir/level.tmp" && mv "$state_dir/level.tmp" "$state_dir/level"
+}
+
+# Append {"time":<unix seconds>,"text":"..."} to the history, keeping the newest
+# $history_size entries. The text is one line already; JSON needs backslashes
+# and quotes escaped, and control characters are dropped rather than escaped.
+save_to_history() {
+    local text
+    text=$(printf '%s' "$1" | tr '\t\r\n' '   ' | tr -d '\000-\037')
+    text=${text//\\/\\\\}
+    text=${text//\"/\\\"}
+    mkdir -p "$data_dir" || return
+    {
+        # awk ends every line with a newline, in case a hand edit dropped the last
+        tail -n "$((history_size - 1))" "$history_file" 2>/dev/null | awk 1
+        printf '{"time":%s,"text":"%s"}\n' "$EPOCHSECONDS" "$text"
+    } >"$history_file.tmp" && mv "$history_file.tmp" "$history_file"
+}
+
+# Terminals paste with Ctrl+Shift+V; Ctrl+V there inserts a literal ^V
+focused_is_terminal() {
+    local app_id
+    app_id=$(niri msg --json focused-window 2>/dev/null | grep -o '"app_id":"[^"]*"')
+    app_id=${app_id#'"app_id":"'}
+    case ${app_id%'"'} in
+        kitty | Alacritty | foot | footclient | com.mitchellh.ghostty | org.wezfurlong.wezterm | \
+            org.kde.konsole | com.system76.CosmicTerm | org.gnome.Console | org.gnome.Ptyxis | \
+            org.gnome.Terminal | gnome-terminal-server | kgx | xterm | XTerm) return 0 ;;
+    esac
+    return 1
+}
+
+# The one format of the clipboard worth putting back (copied files, text or an
+# image, else whatever it offers first); fails when the clipboard is empty.
+# Restoring a single format loses e.g. the HTML of a rich copy.
+clipboard_format() {
+    local types format
+    types=$(wl-paste --list-types 2>/dev/null) || return 1
+    for format in x-special/gnome-copied-files 'text/plain;charset=utf-8' UTF8_STRING text/plain image/png; do
+        if grep -qxF -- "$format" <<<"$types"; then
+            printf '%s\n' "$format"
+            return 0
+        fi
+    done
+    head -n 1 <<<"$types"
+}
+
+# Paste $1 into the focused window through the clipboard, then put back what
+# the clipboard held once the window has had time to read it
+paste_text() {
+    local format saved keys restore
+    saved=$(mktemp) || return 1 # outlives $tmp: the restore runs after we exit
+    if format=$(clipboard_format) && wl-paste --no-newline --type "$format" >"$saved" 2>/dev/null; then
+        restore=(wl-copy --type "$format")
+        # Keep a password manager's hint, so histories skip it this time too
+        wl-paste --list-types | grep -qx x-kde-passwordManagerHint && restore+=(--sensitive)
+    else
+        restore=(wl-copy --clear)
+    fi
+
+    if ! printf '%s' "$1" | wl-copy --sensitive; then
+        rm -f "$saved"
+        return 1
+    fi
+    if focused_is_terminal; then keys=(-M ctrl -M shift -k v -m shift -m ctrl); else keys=(-M ctrl -k v -m ctrl); fi
+    if ! wtype "${keys[@]}"; then
+        # Leave the text on the clipboard to paste by hand
+        rm -f "$saved"
+        return 1
+    fi
+
+    (
+        sleep 0.5
+        "${restore[@]}" <"$saved"
+        rm -f "$saved"
+    ) >/dev/null 2>&1 &
+}
+
+# Whisper's output as one line, minus the marks it puts on non-speech
+# ([BLANK_AUDIO], (music), ...)
+clean_text() {
+    tr '\n' ' ' | sed -E 's/\[[^]]*\]|\([^)]*\)//g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+join_text() {
+    local text="$1 $2"
+    text=${text# }
+    printf '%s' "${text% }"
+}
+
+# WAV header for $1 bytes of the raw recording (16 kHz mono s16le)
+le32() { printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)); }
+wav_header() {
+    # shellcheck disable=SC2059 # the format is made of escapes on purpose
+    printf "RIFF$(le32 $((36 + $1)))WAVEfmt $(le32 16)\\x01\\x00\\x01\\x00$(le32 16000)$(le32 32000)\\x02\\x00\\x10\\x00data$(le32 "$1")"
+}
+
+# Transcribe bytes [$1, $2) of the recording on the server, with $prompt (the
+# committed text) as what came before; prints the text. One dd, not
+# tail | head: with audio after the range (a commit), tail dies of SIGPIPE
+# once head is done, and pipefail fails the whole pass.
+transcribe_range() {
+    local len=$(($2 - $1))
+    {
+        wav_header "$len"
+        dd if="$tmp/mic.raw" iflag=skip_bytes,count_bytes skip="$1" count="$len" bs=64K status=none
+    } >"$tmp/pass.wav" &&
+        curl -fsS --max-time 30 -F "file=@$tmp/pass.wav" -F response_format=text \
+            --form-string "prompt=$prompt" "$server_url/inference" | clean_text
+}
+
+# Where to commit, as a count of meter windows: the middle of the latest pause
+# (4+ quiet windows) among windows ($1, $2], else the quietest one of them
+latest_pause() {
+    awk -v lo="$1" -v hi="$2" -v db="$speech_db" '
+        NR > hi { exit }
+        NR > lo && $1 <= db { if (!run) start = NR; run++; next }
+        { if (run >= 4) cut = start - 1 + int(run / 2); run = 0 }
+        END { if (run >= 4) cut = start - 1 + int(run / 2); if (cut) print cut }' "$tmp/levels"
+}
+quietest_window() {
+    awk -v lo="$1" -v hi="$2" '
+        NR > hi { exit }
+        NR > lo && (!cut || $1 < min) { min = $1; cut = NR }
+        END { if (cut) print cut }' "$tmp/levels"
+}
+
+show_live() { printf '%s\n' "$1" >"$state_dir/live.tmp" && mv "$state_dir/live.tmp" "$state_dir/live"; }
+
+# Live transcription, in the background while recording (see the top). Counts
+# meter windows: $off where the uncommitted audio starts, $covered how far the
+# last pass reached. Writes $state_dir/live as it goes and, once the main loop
+# creates $tmp/recorded, the final text to $tmp/final.
+live_loop() {
+    trap - EXIT INT TERM
+    local off=0 covered=0 n last first cut end text committed="" draft="" prompt="" recorded tries=0
+    # A server that dies (port taken, no GPU memory) or never loads means the
+    # batch fallback
+    until curl -fs -o /dev/null "$server_url/health"; do
+        kill -0 "$server_pid" 2>/dev/null && ((tries++ < 300)) || return 1
+        sleep 0.1
+    done
+    while :; do
+        # Checked before reading the levels, so they are complete once it shows
+        recorded=false
+        [[ -f $tmp/recorded ]] && recorded=true
+        read -r n last < <(awk -v db="$speech_db" '$1 > db { last = NR } END { print NR, last + 0 }' "$tmp/levels")
+
+        if $recorded; then
+            # The last pass is final if it reached 300 ms past the last speech
+            if ((last > off && covered < last + 3)); then
+                end=$(stat -c %s "$tmp/mic.raw")
+                draft=$(transcribe_range $((off * window_bytes)) $((end / 2 * 2))) || return 1
+            fi
+            join_text "$committed" "$draft" >"$tmp/final.tmp" && mv "$tmp/final.tmp" "$tmp/final"
+            return 0
+        fi
+
+        # Nothing to do before speech, or while it is all transcribed already
+        first=$(cat "$tmp/spoke" 2>/dev/null) || first=
+        if [[ -z $first ]] || ((n < first + 5 || last <= off || covered >= last + 3)); then
+            sleep 0.05
+            continue
+        fi
+        # Wait for half a second of new audio, unless the speech just ended
+        if ((n < covered + 5 && n < last + 3)); then
+            sleep 0.05
+            continue
+        fi
+
+        if ((n - off > 200)); then
+            cut=$(latest_pause $((off + 50)) $((n - 5)))
+            if [[ -z $cut ]] && ((n - off > 280)); then
+                cut=$(quietest_window $((off + 150)) $((n - 5)))
+            fi
+            if [[ -n $cut ]]; then
+                text=$(transcribe_range $((off * window_bytes)) $((cut * window_bytes))) || return 1
+                committed=$(join_text "$committed" "$text")
+                prompt=$committed
+                ((${#prompt} > 400)) && prompt=${prompt: -400}
+                off=$cut covered=$cut draft=""
+                continue
+            fi
+        fi
+
+        draft=$(transcribe_range $((off * window_bytes)) $((n * window_bytes))) || return 1
+        covered=$n
+        show_live "$(join_text "$committed" "$draft")"
+    done
+}
+
+tmp=$(mktemp -d)
+ff_pid=
+server_pid=
+live_pid=
+
+cleanup() {
+    [[ -n $live_pid ]] && kill "$live_pid" 2>/dev/null
+    [[ -n $server_pid ]] && kill "$server_pid" 2>/dev/null
+    [[ -n $ff_pid ]] && kill -KILL "$ff_pid" 2>/dev/null
+    noctalia msg panel-close "$panel" >/dev/null 2>&1
+    rm -rf "$tmp" "$state_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+echo $$ >"$state_dir/pid"
+rm -f "$state_dir/stop" "$state_dir/cancel" "$state_dir/lock" "$state_dir/type" "$state_dir/live"
+# Before the panel opens, so it shows the starting state from its first frame
+$lock_by_default && : >"$state_dir/lock"
+$type_by_default && : >"$state_dir/type"
+set_state listening
+set_level 0
+noctalia msg panel-open "$panel" >/dev/null 2>&1 &
+
+# The model loads (~1 s) while you start speaking; it leaves the GPU when the
+# dictation ends
+if [[ -f $model_file ]] && command -v whisper-server >/dev/null; then
+    # One left behind by a dictation that was killed outright would hold the
+    # port (and GPU memory) for good
+    pkill -u "$UID" -f "^whisper-server .* --port ${server_url##*:} " 2>/dev/null
+    whisper-server -m "$model_file" --host 127.0.0.1 --port "${server_url##*:}" \
+        -l "$lang" -nt -bs 5 -bo 5 >"$tmp/server.log" 2>&1 &
+    server_pid=$!
+fi
+
+# Record 16 kHz mono raw PCM, flushed as it comes so the live passes can read
+# it, and from the same capture print one RMS reading per 100 ms window to a
+# FIFO so we can drive the indicator and detect silence. An audio file as the
+# source plays in real time instead.
+input=(-f pulse -i "$source")
+[[ -f $source ]] && input=(-re -i "$source")
+mkfifo "$tmp/meter"
+: >"$tmp/levels"
+ffmpeg -nostdin -loglevel error -y "${input[@]}" \
+    -filter_complex "aformat=sample_rates=16000:channel_layouts=mono,asplit=2[rec][mon];\
+[mon]asetnsamples=n=$((16000 * window_ms / 1000)):p=0,\
+astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,\
+ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=$tmp/meter:direct=1,anullsink" \
+    -map "[rec]" -f s16le -flush_packets 1 "$tmp/mic.raw" &
+ff_pid=$!
+# Read-write open does not block if ffmpeg never opens its end (bad source)
+exec 3<>"$tmp/meter"
+
+if [[ -n $server_pid ]]; then
+    live_loop &
+    live_pid=$!
+fi
+
+speech_windows=0 # windows above the speech threshold
+quiet_windows=0  # consecutive quiet windows since the last speech
+windows=0
+spoke=false
+locked=false
+waiting_since=0 # window the no-speech countdown started at (reset on unlock)
+reason=
+pause_windows=$((pause * 1000 / window_ms))
+wait_windows=$((wait_secs * 1000 / window_ms))
+max_windows=$((max_secs * 1000 / window_ms))
+
+# No reading for 2 s means ffmpeg died or the source delivers nothing
+while IFS= read -r -t 2 line <&3; do
+    [[ $line == lavfi.astats.Overall.RMS_level=* ]] || continue
+    db=${line#*=}
+    windows=$((windows + 1))
+
+    # Level meter: map -60..-10 dBFS onto 0..100; integer dB is plenty
+    # (string truncation, since printf would parse "-33.4" per the locale)
+    if [[ $db == -inf ]]; then db_int=-100; else db_int=${db%%.*}; fi
+    level=$(((db_int + 60) * 2))
+    ((level < 0)) && level=0
+    ((level > 100)) && level=100
+    set_level "$level"
+    # The live passes find speech and pauses in these
+    printf '%s\n' "$db_int" >>"$tmp/levels"
+
+    if ((db_int > speech_db)); then
+        speech_windows=$((speech_windows + 1))
+        quiet_windows=0
+        # Two windows (200 ms) of sound before we call it speech, so a click
+        # or a cough does not arm the auto-stop
+        if ! $spoke && ((speech_windows >= 2)); then
+            spoke=true
+            printf '%s\n' "$windows" >"$tmp/spoke"
+        fi
+    else
+        quiet_windows=$((quiet_windows + 1))
+    fi
+
+    if [[ -f $state_dir/cancel ]]; then reason=cancel; break; fi
+    if [[ -f $state_dir/stop ]]; then reason=stop; break; fi
+    if ((windows >= max_windows)); then reason=max; break; fi
+
+    # Locked (from the panel or `dictate lock`): only a stop/cancel ends it.
+    # Unlocking restarts the pause countdown instead of stopping at once.
+    if [[ -f $state_dir/lock ]]; then
+        locked=true
+        continue
+    elif $locked; then
+        locked=false
+        quiet_windows=0
+        waiting_since=$windows
+    fi
+
+    if $spoke && ((quiet_windows >= pause_windows)); then reason=pause; break; fi
+    if ! $spoke && ((windows - waiting_since >= wait_windows)); then reason=nospeech; break; fi
+done
+exec 3<&-
+
+# SIGINT lets ffmpeg flush the last packet; raw output needs nothing else, so a
+# slow one gets killed soon
+kill -INT "$ff_pid" 2>/dev/null
+for _ in {1..5}; do
+    kill -0 "$ff_pid" 2>/dev/null || break
+    sleep 0.1
+done
+kill -KILL "$ff_pid" 2>/dev/null
+wait "$ff_pid" 2>/dev/null
+ff_pid=
+: >"$tmp/recorded"
+
+case $reason in
+    cancel) exit 0 ;;
+    nospeech) notify "No speech heard, nothing typed."; exit 0 ;;
+    "") notify "Could not record from the microphone."; exit 1 ;;
+esac
+
+# A manual stop before any speech: whisper would only hallucinate on silence
+if ! $spoke; then
+    exit 0
+fi
+
+set_level 0
+text=
+live_ok=false
+if [[ -n $live_pid ]]; then
+    # Usually the pass that ran when you paused has the final text already;
+    # only show "Transcribing" when there is a real wait
+    for _ in {1..3}; do
+        kill -0 "$live_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -0 "$live_pid" 2>/dev/null && set_state transcribing
+    wait "$live_pid" && [[ -f $tmp/final ]] && live_ok=true
+    live_pid=
+fi
+# Off the GPU before pasting
+[[ -n $server_pid ]] && kill "$server_pid" 2>/dev/null
+server_pid=
+
+if $live_ok; then
+    text=$(<"$tmp/final")
+else
+    # No server or it failed: transcribe the whole recording in one go
+    set_state transcribing
+    size=$(($(stat -c %s "$tmp/mic.raw") / 2 * 2))
+    { wav_header "$size"; head -c "$size" "$tmp/mic.raw"; } >"$tmp/mic.wav"
+    transcribe=$HOME/.local/bin/transcribe
+    [[ -x $transcribe ]] || transcribe=transcribe
+    text=$("$transcribe" -l "$lang" "$tmp/mic.wav" 2>/dev/null | clean_text)
+fi
+
+[[ -f $state_dir/cancel ]] && exit 0
+
+noctalia msg panel-close "$panel" >/dev/null 2>&1
+
+if [[ -z $text ]]; then
+    notify "Could not make out any words."
+    exit 0
+fi
+
+save_to_history "$text"
+
+# Typing turned off (keyboard button, `dictate type` or the plugin setting):
+# the history is where it goes
+[[ -f $state_dir/type ]] || exit 0
+
+if ! paste_text "$text"; then
+    if wl-paste --no-newline 2>/dev/null | cmp -s - <(printf '%s' "$text"); then
+        notify "Pasting failed, the text is in the clipboard."
+    else
+        notify "Pasting failed, the text is in the dictation history."
+    fi
+fi

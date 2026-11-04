@@ -1,0 +1,84 @@
+# Noctalia side of ~/.local/bin/dictate: the bottom-center mic indicator while
+# it runs, and a bar icon with the history of transcriptions. Lives in the
+# auto-discovered "local" plugin source (~/.local/share/noctalia/plugins).
+#
+# The script and the plugin only share files:
+#   $XDG_RUNTIME_DIR/dictate/  the running dictation: state, level and the live
+#                              text, written by the script and polled by the
+#                              indicator, plus the stop/cancel/lock/type files
+#                              its buttons make. The script opens/closes the
+#                              indicator panel.
+#   $XDG_STATE_HOME/dictate/   history.jsonl, which the script appends to and the
+#                              history panel lists, and settings, where the
+#                              service mirrors the [[setting]] values below for
+#                              the script.
+id = "luiz/dictation"
+name = "Dictation"
+version = "1.1.0"
+plugin_api = 30 # the newest this Noctalia build supports
+author = "luiz"
+license = "MIT"
+dependencies = []
+tags = ["audio", "panel", "utility"]
+icon = "bubble-text"
+description = "Indicator for the dictate script and a bar icon with the history of transcriptions."
+
+# The script reads these through the service's settings file; keep its
+# fallback defaults in sync
+[[setting]]
+key = "history_size"
+type = "int"
+label_key = "settings.history_size.label"
+description_key = "settings.history_size.description"
+default = 100
+min = 1
+max = 1000
+
+[[setting]]
+key = "type_by_default"
+type = "bool"
+label_key = "settings.type_by_default.label"
+description_key = "settings.type_by_default.description"
+default = true
+
+[[setting]]
+key = "lock_by_default"
+type = "bool"
+label_key = "settings.lock_by_default.label"
+description_key = "settings.lock_by_default.description"
+default = false
+
+# Persistent + keyboard_focus "none": stays up next to other panels and never
+# takes focus from the window the text will be typed into.
+[[panel]]
+id = "indicator"
+entry = "indicator.luau"
+width = 420
+# ~3 lines of live text, an 8 px gap and the 32 px badge, plus the panel's own
+# ~13 px padding top and bottom
+height = 130
+placement = "floating"
+position = "bottom_center"
+layer = "overlay"
+persistent = true
+dismiss_on_outside_click = false
+keyboard_focus = "none"
+
+# Opened by the bar icon, next to it
+[[panel]]
+id = "history"
+entry = "history.luau"
+width = 380
+height = 480
+placement = "attached"
+position = "auto"
+open_near_click = true
+
+# Add to a bar as "luiz/dictation:bar"
+[[widget]]
+id = "bar"
+entry = "bar.luau"
+
+[[service]]
+id = "service"
+entry = "service.luau"
